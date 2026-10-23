@@ -54,24 +54,40 @@ function pixelState(data) {
   return visible ? 'black' : 'empty';
 }
 
-function readVideoTexture(video, context, createCanvas) {
+// Android can cache a decoded SurfaceTexture against its WebGL context. Losing
+// that context after a capture can corrupt later readbacks (solid purple/black).
+// Keep one small set of GPU resources per video, reclaimed with the video/page.
+const videoReadbacks = new WeakMap();
+
+function updateVideoTexture(video, createCanvas) {
   // Firefox Android can display a hardware-decoded frame yet silently ignore
   // drawImage(video). Uploading to a GPU texture uses a different readback path.
   // https://bugzilla.mozilla.org/show_bug.cgi?id=1526207
-  const canvas = createCanvas();
-  canvas.width = canvas.height = 1;
-  let gl;
-  let texture;
-  let framebuffer;
+  const previous = videoReadbacks.get(video);
+  const canvas = previous?.canvas || createCanvas();
+  if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth;
+  if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight;
+  let gl = previous?.gl;
+  let texture = previous?.texture;
+  let framebuffer = previous?.framebuffer;
+  if (previous) previous.valid = false;
   try {
-    gl = canvas.getContext('webgl', { depth: false, stencil: false, antialias: false });
+    gl ||= canvas.getContext('webgl', {
+      depth: false, stencil: false, antialias: false, preserveDrawingBuffer: true,
+    });
     if (!gl) return false;
+    if (gl.isContextLost()) {
+      videoReadbacks.delete(video);
+      return false;
+    }
     const { videoWidth: width, videoHeight: height } = video;
     const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     if (width > maxSize || height > maxSize) return false;
-    texture = gl.createTexture();
-    framebuffer = gl.createFramebuffer();
+    texture ||= gl.createTexture();
+    framebuffer ||= gl.createFramebuffer();
     if (!texture || !framebuffer) return false;
+    const surface = previous || { canvas, gl, texture, framebuffer };
+    videoReadbacks.set(video, surface);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -84,20 +100,101 @@ function readVideoTexture(video, context, createCanvas) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) return false;
-    const image = context.createImageData(width, height);
-    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(image.data.buffer));
-    if (gl.getError() !== gl.NO_ERROR || gl.isContextLost() || pixelState(image.data) === 'empty') return false;
-    context.putImageData(image, 0, 0);
-    return true;
+    if (gl.getError() !== gl.NO_ERROR || gl.isContextLost()) return false;
+    Object.assign(surface, { source: video.currentSrc, width, height, valid: true });
+    return surface;
   } catch (error) {
     if (error.name === 'SecurityError') throw error;
     return false;
   } finally {
-    if (texture) gl.deleteTexture(texture);
-    if (framebuffer) gl.deleteFramebuffer(framebuffer);
-    gl?.getExtension('WEBGL_lose_context')?.loseContext();
-    canvas.width = canvas.height = 0;
+    // Release partial/failed initialization only. In particular, do not call
+    // WEBGL_lose_context after capture: Firefox Android still needs this context
+    // for its cached hardware-decoded frame, even after pixels reach the CPU.
+    if (videoReadbacks.get(video)?.gl !== gl) {
+      if (texture) gl.deleteTexture(texture);
+      if (framebuffer) gl.deleteFramebuffer(framebuffer);
+      canvas.width = canvas.height = 0;
+    }
   }
+}
+
+function readVideoTexture(video, context, createCanvas) {
+  let surface = videoReadbacks.get(video);
+  if (!surface) surface = updateVideoTexture(video, createCanvas);
+  // Read the prepared texture, never re-import an already displayed frame.
+  if (!surface?.valid || surface.source !== video.currentSrc) return false;
+  const { gl, framebuffer, width, height } = surface;
+  if (gl.isContextLost() || width !== video.videoWidth || height !== video.videoHeight) return false;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+  const pixels = new Uint8Array(width * height * 4);
+  gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  if (gl.getError() !== gl.NO_ERROR || gl.isContextLost() || pixelState(pixels) === 'empty') return false;
+  const image = context.createImageData(width, height);
+  image.data.set(pixels);
+  context.putImageData(image, 0, 0);
+  return true;
+}
+
+export function prepareFrameCapture(video, createCanvas = () => document.createElement('canvas')) {
+  // Run synchronously on loadeddata/seeked, before the compositor takes the
+  // decoded surface. Firefox Android may expose only purple pixels if the
+  // first GPU capture is initialized later, after the video frame is displayed.
+  let canvas;
+  try {
+    if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) return false;
+    if (videoReadbacks.has(video)) return !!updateVideoTexture(video, createCanvas);
+    canvas = createCanvas();
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    if (!context) return false;
+    let state = 'empty';
+    try {
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      state = pixelState(context.getImageData(0, 0, canvas.width, canvas.height).data);
+    } catch (error) {
+      if (!['InvalidStateError', 'NS_ERROR_NOT_AVAILABLE'].includes(error.name)) return false;
+    }
+    return state !== 'empty' || !!updateVideoTexture(video, createCanvas);
+  } catch { return false; } // Report failures only if the viewer requests a capture.
+  finally { if (canvas) canvas.width = canvas.height = 0; }
+}
+
+export function initFrameCapture(video, createCanvas = () => document.createElement('canvas')) {
+  let frameID = null;
+  let generation = 0;
+  function cancel() {
+    generation++;
+    if (frameID !== null) video.cancelVideoFrameCallback?.(frameID);
+    frameID = null;
+    const surface = videoReadbacks.get(video);
+    if (surface) surface.valid = false;
+  }
+  function queue() {
+    if (frameID !== null || !videoReadbacks.has(video) || typeof video.requestVideoFrameCallback !== 'function') return;
+    const current = generation;
+    frameID = video.requestVideoFrameCallback(() => {
+      if (current !== generation) return;
+      frameID = null;
+      prepareFrameCapture(video, createCanvas);
+      queue();
+    });
+  }
+  function prepare() {
+    prepareFrameCapture(video, createCanvas);
+    queue();
+  }
+  // Only browsers needing the GPU fallback copy each presented frame. No CPU
+  // pixel readback or PNG encoding happens until a screenshot is requested.
+  const events = ['loadeddata', 'seeked', 'resize'];
+  for (const event of events) video.addEventListener(event, prepare);
+  video.addEventListener('emptied', cancel);
+  prepare();
+  return { destroy() {
+    cancel();
+    for (const event of events) video.removeEventListener(event, prepare);
+    video.removeEventListener('emptied', cancel);
+  } };
 }
 
 export async function captureFrame(video, createCanvas = () => document.createElement('canvas')) {

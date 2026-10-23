@@ -1,11 +1,12 @@
 import { normalizeSource, detectFormat, isKnownLiveFLV, readSource, createPlayerLink, sourceLabel } from './player-utils.js';
-import { qualityChoices, screenshotFilename, captureFrame } from './player-tools.js';
+import { qualityChoices, screenshotFilename, initFrameCapture, captureFrame } from './player-tools.js';
 import { initPlayerControls } from './player-controls.js';
 import { LiveMP4Player } from './live-mp4.js';
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
 const controls = initPlayerControls($('player'), video);
+initFrameCapture(video);
 const exampleURL = new URL('assets/example.flv', document.baseURI).href;
 let engine = null;
 let source = null;
