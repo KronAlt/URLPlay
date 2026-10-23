@@ -48,6 +48,9 @@ input[type=checkbox]{accent-color:var(--accent);margin:0;width:12px;height:12px}
 .form-error{font-size:12px;color:#ac382b;margin-bottom:0}
 .video-shell{background:#101210;aspect-ratio:16/9;position:relative;margin:0 10px;border-radius:5px;overflow:hidden}
 video{display:block;width:100%;height:100%;background:#101210;object-fit:contain}
+video.frame-rendered{visibility:hidden}
+.frame-renderer{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#101210;z-index:1;cursor:pointer}
+.controls-idle .frame-renderer{cursor:none}
 .center-play{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:4;display:grid;place-items:center;width:clamp(52px,10vw,84px);height:clamp(52px,10vw,84px);border:1px solid #ffffff60;border-radius:50%;background:#d8542deF;color:#fff;box-shadow:0 4px 24px #0006;transition:background .15s}
 .center-play svg{width:42%;height:42%;margin-left:3px}
 .center-play:hover{background:var(--accent-hover)}

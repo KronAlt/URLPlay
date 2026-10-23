@@ -54,10 +54,72 @@ function pixelState(data) {
   return visible ? 'black' : 'empty';
 }
 
-// Android can cache a decoded SurfaceTexture against its WebGL context. Losing
-// that context after a capture can corrupt later readbacks (solid purple/black).
-// Keep one small set of GPU resources per video, reclaimed with the video/page.
+// Some Android decoders cannot share their SurfaceTexture between the native
+// compositor and WebGL. The fallback owns both presentation and capture, using
+// one persistent texture/context per video instead of competing for the frame.
 const videoReadbacks = new WeakMap();
+
+function createFramePresenter(surface, video) {
+  if (!video.parentElement) return null;
+  const { gl, canvas } = surface;
+  const shaders = [];
+  let program;
+  let vertices;
+  try {
+    for (const [type, source] of [
+      [gl.VERTEX_SHADER, 'attribute vec2 position; varying vec2 uv; void main(){ gl_Position=vec4(position,0.,1.); uv=vec2((position.x+1.)*.5,(1.-position.y)*.5); }'],
+      [gl.FRAGMENT_SHADER, 'precision mediump float; varying vec2 uv; uniform sampler2D frame; void main(){ gl_FragColor=texture2D(frame,uv); }'],
+    ]) {
+      const shader = gl.createShader(type);
+      shaders.push(shader);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error('Video renderer shader failed.');
+    }
+    program = gl.createProgram();
+    for (const shader of shaders) gl.attachShader(program, shader);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error('Video renderer initialization failed.');
+    vertices = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const position = gl.getAttribLocation(program, 'position');
+    const frame = gl.getUniformLocation(program, 'frame');
+    canvas.className = 'frame-renderer';
+    canvas.setAttribute('aria-hidden', 'true');
+    canvas.addEventListener('click', () => video.click());
+    video.parentElement.insertBefore(canvas, video.nextSibling);
+    video.classList.add('frame-rendered');
+    return {
+      draw() {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, surface.width, surface.height);
+        gl.useProgram(program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertices);
+        gl.enableVertexAttribArray(position);
+        gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, surface.texture);
+        gl.uniform1i(frame, 0);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        canvas.hidden = false;
+      },
+      hide() { canvas.hidden = true; },
+      destroy() {
+        canvas.remove();
+        video.classList.remove('frame-rendered');
+        gl.deleteBuffer(vertices);
+        gl.deleteProgram(program);
+      },
+    };
+  } catch (error) {
+    if (vertices) gl.deleteBuffer(vertices);
+    if (program) gl.deleteProgram(program);
+    throw error;
+  } finally {
+    for (const shader of shaders) gl.deleteShader(shader);
+  }
+}
 
 function updateVideoTexture(video, createCanvas) {
   // Firefox Android can display a hardware-decoded frame yet silently ignore
@@ -76,10 +138,7 @@ function updateVideoTexture(video, createCanvas) {
       depth: false, stencil: false, antialias: false, preserveDrawingBuffer: true,
     });
     if (!gl) return false;
-    if (gl.isContextLost()) {
-      videoReadbacks.delete(video);
-      return false;
-    }
+    if (gl.isContextLost()) return false;
     const { videoWidth: width, videoHeight: height } = video;
     const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     if (width > maxSize || height > maxSize) return false;
@@ -101,7 +160,13 @@ function updateVideoTexture(video, createCanvas) {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) return false;
     if (gl.getError() !== gl.NO_ERROR || gl.isContextLost()) return false;
-    Object.assign(surface, { source: video.currentSrc, width, height, valid: true });
+    Object.assign(surface, { source: video.currentSrc, width, height });
+    // Android's decoded surface cannot reliably feed both the native video
+    // compositor and WebGL. Display the same texture we retain for screenshots.
+    if (!surface.presenter) surface.presenter = createFramePresenter(surface, video);
+    surface.presenter?.draw();
+    if (gl.getError() !== gl.NO_ERROR) return false;
+    surface.valid = true;
     return surface;
   } catch (error) {
     if (error.name === 'SecurityError') throw error;
@@ -160,7 +225,11 @@ export function prepareFrameCapture(video, createCanvas = () => document.createE
   finally { if (canvas) canvas.width = canvas.height = 0; }
 }
 
-export function initFrameCapture(video, createCanvas = () => document.createElement('canvas')) {
+export function initFrameCapture(video, createCanvas = () => document.createElement('canvas'), userAgent = globalThis.navigator?.userAgent || '') {
+  // Only Firefox Android needs ownership of the decoded surface before native
+  // composition. Other browsers can briefly return empty pixels on loadeddata;
+  // leave their normal renderer alone and capture on demand once a frame exists.
+  if (!/Android/i.test(userAgent) || !/(?:Firefox|Fennec)\//.test(userAgent)) return { destroy() {} };
   let frameID = null;
   let generation = 0;
   function cancel() {
@@ -168,7 +237,10 @@ export function initFrameCapture(video, createCanvas = () => document.createElem
     if (frameID !== null) video.cancelVideoFrameCallback?.(frameID);
     frameID = null;
     const surface = videoReadbacks.get(video);
-    if (surface) surface.valid = false;
+    if (surface) {
+      surface.valid = false;
+      surface.presenter?.hide();
+    }
   }
   function queue() {
     if (frameID !== null || !videoReadbacks.has(video) || typeof video.requestVideoFrameCallback !== 'function') return;
@@ -192,6 +264,8 @@ export function initFrameCapture(video, createCanvas = () => document.createElem
   prepare();
   return { destroy() {
     cancel();
+    videoReadbacks.get(video)?.presenter?.destroy();
+    videoReadbacks.delete(video);
     for (const event of events) video.removeEventListener(event, prepare);
     video.removeEventListener('emptied', cancel);
   } };
@@ -214,21 +288,27 @@ export async function captureFrame(video, createCanvas = () => document.createEl
     // A stream can change resolution while we wait for its next frame.
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
-    let state = 'empty';
-    try {
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      state = pixelState(context.getImageData(0, 0, canvas.width, canvas.height).data);
-    } catch (error) {
-      if (error.name === 'SecurityError') throw error;
-      if (!['InvalidStateError', 'NS_ERROR_NOT_AVAILABLE'].includes(error.name)) throw error;
-    }
-    if (state !== 'image' && !readVideoTexture(video, context, createCanvas)) {
-      // Opaque black may be the actual video frame; never reject it merely
-      // for being dark. A transparent canvas indicates that no frame was drawn.
-      if (state !== 'black') {
-        if (!video.paused && attempt === 0) continue;
-        throw new Error('Your browser could not read this video frame. Try another browser or your device’s screenshot controls.');
+    let captured = false;
+    if (videoReadbacks.has(video)) {
+      // Once the fallback owns the decoded surface, capture exactly the texture
+      // shown in the player. A second native read can interfere with that owner.
+      captured = readVideoTexture(video, context, createCanvas);
+    } else {
+      let state = 'empty';
+      try {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        state = pixelState(context.getImageData(0, 0, canvas.width, canvas.height).data);
+      } catch (error) {
+        if (error.name === 'SecurityError') throw error;
+        if (!['InvalidStateError', 'NS_ERROR_NOT_AVAILABLE'].includes(error.name)) throw error;
       }
+      // Opaque black may be the actual video frame. Only an empty/transparent
+      // canvas indicates that drawing failed and needs the fallback.
+      captured = state !== 'empty' || readVideoTexture(video, context, createCanvas);
+    }
+    if (!captured) {
+      if (!video.paused && attempt === 0) continue;
+      throw new Error('Your browser could not read this video frame. Try another browser or your device’s screenshot controls.');
     }
     return new Promise((resolve, reject) => {
       canvas.toBlob((blob) => {
