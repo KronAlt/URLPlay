@@ -4,7 +4,7 @@ URLplay is a browser-based video player for direct FLV, MP4, and HLS (`.m3u8`) l
 
 ## Interface and functionality
 
-Paste a video URL, select **Load video**, and press the centered **Play** button. The format is detected automatically, with a manual format selector available. Weibo FLV links on `plwb.live.weibo.com/alicdn/` automatically enable live mode. For other live FLV streams or growing and continuously streamed fragmented MP4, enable **Live FLV / MP4**; completed MP4 files play directly through the browser.
+Paste a video URL, select **Load video**, and press the centered **Play** button. The format is detected automatically, with a manual format selector available. For FLV streams or growing and continuously streamed fragmented MP4, enable **Live FLV / MP4**; completed MP4 files play directly through the browser.
 
 The player includes:
 
